@@ -146,8 +146,7 @@ assert result.lazydata.base.realized is not None, "the LazyBuffer is realized!"
 assert isinstance(result.lazydata.base.realized, Buffer)
 assert result.lazydata.base.realized.device == "CLANG"
 # getting ahead of ourselves, but we can move the Buffer to CPU
-out = result.lazydata.base.realized.as_buffer().cast('I')
-assert out[0] == 5, "when put in numpy, it's 5"
+assert result.lazydata.base.realized.toCPU()[0] == 5, "when put in numpy with toCPU, it's 5"
 
 # %%
 # == Union[Interpreted, Compiled] (in tinygrad/device.py, code 6/10) ==
@@ -159,7 +158,8 @@ class Interpreted:
   # and they have a lookup table to functions for the Ops
   fxn_for_op: Dict[Op, Callable] = {
     UnaryOps.EXP2: lambda x: np.exp2(x),
-    BinaryOps.ADD: lambda x,y: x+y}
+    BinaryOps.ADD: lambda x,y: x+y
+  }
 
 # Compiled backends take a little more (example: GPU and LLVM)
 class Compiled:
@@ -187,6 +187,9 @@ class Buffer(ABC):
   # `opaque` is an opaque container class
   def __init__(self, device:str, size:int, dtype:DType, opaque:Any=None): pass
 
+  # toCPU converts the RawBuffer to a numpy array with shape (size,)
+  def toCPU(self) -> np.ndarray: pass
+
 # %%
 # == Example: 2+3 in raw clang ==
 
@@ -198,7 +201,7 @@ from tinygrad.device import MallocAllocator
 # ClangProgram is the simplest runtime (in tinygrad/runtime/ops_clang.py, code 7/10)
 # __init__ calls clang, and __call__ calls the function in the *.so outputted by clang
 # in CLANG, global_size and local_size are ignored
-from tinygrad.runtime.ops_clang import ClangProgram, ClangCompiler
+from tinygrad.runtime.ops_clang import ClangProgram, compile_clang
 
 # a concrete example looks like this, this adds two size 1 RawBuffer
 # first we create two numpy buffers containing 2 and 3
@@ -213,7 +216,7 @@ MallocAllocator.copyin(input_a, numpy_a.data.cast("B"))
 MallocAllocator.copyin(input_b, numpy_b.data.cast("B"))
 
 # compile the program, run it, and 2+3 does indeed equal 5
-program = ClangProgram("add", ClangCompiler().compile(f"void add(float *a, float *b, float *c) {{ *a = *b + *c; }}"))
+program = ClangProgram("add", compile_clang(f"void add(float *a, float *b, float *c) {{ *a = *b + *c; }}"))
 program(output, input_a, input_b)
 numpy_out = np.empty(1, dtype=np.float32)
 MallocAllocator.copyout(numpy_out.data.cast("B"), output)
@@ -251,7 +254,7 @@ result = Tensor(2.0).realize() + Tensor(3.0).realize()
 # use the real Linearizer to linearize 2+3
 from tinygrad.codegen.linearizer import Linearizer
 sched = result.lazydata.schedule()
-linearizer = Linearizer(sched[-1].ast, ClangCompiler.linearizer_opts)
+linearizer = Linearizer(sched[-1].ast)
 linearizer.linearize()
 
 # print the uops
@@ -306,23 +309,23 @@ from tinygrad.shape.shapetracker import ShapeTracker
 # create a virtual (10, 10) Tensor. this is just a shape, there's no actual tensor
 a = ShapeTracker.from_shape((10, 10))
 
-# you'll see it has one view. the (10, 1 are the strides)
-print(a) # ShapeTracker(shape=(10, 10), views=[View((10, 10), (10, 1), 0)])
+# you'll see it has one view
+print(a) # ShapeTracker(views=(View(shape=(10, 10), strides=(10, 1))))
 
 # we can permute it, and the strides change
 a = a.permute((1,0))
-print(a) # ShapeTracker(shape=(10, 10), views=[View((10, 10), (1, 10), 0)])
+print(a) # ShapeTracker(views=(View(shape=(10, 10), strides=(1, 10))))
 
 # we can then reshape it, and the strides change again
 # note how the permute stays applied
 a = a.reshape((5,2,5,2))
-print(a) # ShapeTracker(shape=(5, 2, 5, 2), views=[View((5, 2, 5, 2), (2, 1, 20, 10), 0)])
+print(a) # ShapeTracker(views=(View(shape=(5, 2, 5, 2), strides=(2, 1, 20, 10))))
 
 # now, if we were to reshape it to a (100,) shape tensor, we have to create a second view
 a = a.reshape((100,))
-print(a) # ShapeTracker(shape=(100,), views=[
-         #   View((5, 2, 5, 2), (2, 1, 20, 10), 0),
-         #   View((100,), (1,), 0)])
+print(a) # ShapeTracker(views=(
+         #   View(shape=(5, 2, 5, 2), strides=(2, 1, 20, 10)), 
+         #   View(shape=(100,), strides=(1,))))
 
 # Views stack on top of each other, to allow zero copy for any number of MovementOps
 # we can render a Python expression for the index at any time
@@ -335,17 +338,17 @@ idx, _ = a.expr_idxs()
 print(idx.render())  # ((idx1*10)+idx0)
 
 # the ShapeTracker still has two views though...
-print(a) # ShapeTracker(shape=(10, 10), views=[
-         #   View((5, 2, 5, 2), (2, 1, 20, 10), 0),
-         #   View((10, 10), (10, 1), 0)])
+print(a) # ShapeTracker(views=(
+         #   View(shape=(5, 2, 5, 2), strides=(2, 1, 20, 10), 
+         #   View(shape=(10, 10), strides=(10, 1))))
 
 # ...until we simplify it!
 a = a.simplify()
-print(a) # ShapeTracker(shape=(10, 10), views=[View((10, 10), (1, 10), 0)])
+print(a) # ShapeTracker(views=(View(shape=(10, 10), strides=(1, 10), offset=0)))
 
 # and now we permute it back
 a = a.permute((1,0))
-print(a) # ShapeTracker(shape=(10, 10), views=[View((10, 10), (10, 1), 0)])
+print(a) # ShapeTracker(views=(View(shape=(10, 10), strides=(10, 1), offset=0)))
 
 # and it's even contiguous
 assert a.contiguous == True
